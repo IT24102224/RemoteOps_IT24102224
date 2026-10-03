@@ -9,3 +9,6 @@ Calculated the required personalisation values from registration number IT241022
  Project Directory Setup
 
 Created /home/ashka/RemoteOps_IT24102224 as the project root and agentfiles/IT24102224 as the personalised file-storage directory required by Section 2.4. Created docs/screenshots and tests to organise documentation, evidence, and test files. Verified the directory structure using pwd and find. No source code has been created yet.
+Implemented the initial TCP Agent in agent_224.c and created Makefile_224. Compilation completed without displayed warnings or errors. Verified that the Agent was listening on personalised port 9410 using ss. Two sequential local TCP connections were accepted and closed successfully.
+
+Used this minimal stage to verify socket setup and the accept loop before adding session handling. Captured code and execution screenshots for the Implementation Report. Authentication, command processing, concurrency, file transfers, and UDP monitoring remain pending.

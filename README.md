@@ -31,10 +31,42 @@ and file transfers. UDP will carry periodic monitoring statistics.
 
 ## Current Status
 
-The development environment and project directories have been
-prepared. The Agent and Controller have not yet been implemented.
+The initial TCP Agent has been implemented and tested:
+- Compilation completed without displayed warnings or errors.
+- Listening on personalised TCP port 9410 was verified using ss.
+- Two sequential local connections were accepted and closed.
+
+At this stage, the Agent closes each accepted connection immediately.
+Authentication, command handling, concurrency, file transfers,
+UDP monitoring, logging, and the Controller remain to be implemented.
+
 
 ## Build and Run
 
-Build and run instructions will be added when the source files and
-personalised Makefile have been created and tested.
+Run these commands from the project root.
+
+Build the Agent:
+
+```bash
+make -f Makefile_224
+```
+
+Start the Agent:
+
+```bash
+./agent
+```
+
+Check the listening port from another terminal:
+
+```bash
+ss -tlnp 'sport = :9410'
+```
+
+Stop this initial Agent using Ctrl+C.
+
+Remove the generated executable:
+
+```bash
+make -f Makefile_224 clean
+```
