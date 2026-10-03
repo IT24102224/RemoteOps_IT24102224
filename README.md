@@ -31,21 +31,24 @@ and file transfers. UDP will carry periodic monitoring statistics.
 
 ## Current Status
 
-The initial TCP Agent has been implemented and tested:
-- Compilation completed without displayed warnings or errors.
-- Listening on personalised TCP port 9410 was verified using ss.
-- Two sequential local connections were accepted and closed.
+The initial TCP Agent and Controller have been implemented.
 
-At this stage, the Agent closes each accepted connection immediately.
-Authentication, command handling, concurrency, file transfers,
-UDP monitoring, logging, and the Controller remain to be implemented.
+Verified results:
+- The Agent compiled without displayed warnings or errors.
+- Listening on personalised port 9410 was confirmed using ss.
+- The Agent accepted and closed two sequential local test connections.
+- The C Controller connected successfully to 127.0.0.1:9410.
+- The Agent displayed the corresponding Controller connection.
 
+At this stage, connections are closed without command exchange.
+Authentication, TCP framing, concurrency, command handlers,
+file transfers, UDP monitoring, and logging remain pending.
 
 ## Build and Run
 
 Run these commands from the project root.
 
-Build the Agent:
+Build both programs:
 
 ```bash
 make -f Makefile_224
@@ -57,15 +60,24 @@ Start the Agent:
 ./agent
 ```
 
-Check the listening port from another terminal:
+In another terminal, connect using the Controller:
+
+```bash
+./controller 127.0.0.1
+```
+
+The Controller accepts the Agent's IPv4 address as its argument
+and uses the fixed personalised port 9410.
+
+Check the listening port:
 
 ```bash
 ss -tlnp 'sport = :9410'
 ```
 
-Stop this initial Agent using Ctrl+C.
+Stop the initial Agent using Ctrl+C.
 
-Remove the generated executable:
+Remove both generated executables:
 
 ```bash
 make -f Makefile_224 clean

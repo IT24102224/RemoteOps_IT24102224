@@ -3,10 +3,13 @@ CFLAGS = -std=c11 -Wall -Wextra -Wpedantic -O2
 
 .PHONY: all clean
 
-all: agent	
+all: agent controller
 
 agent: agent_224.c
 	$(CC) $(CFLAGS) -o agent agent_224.c
 
+controller: controller_224.c
+	$(CC) $(CFLAGS) -o controller controller_224.c
+
 clean:
-	rm -f agent
+	rm -f agent controller

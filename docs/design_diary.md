@@ -12,3 +12,8 @@ Created /home/ashka/RemoteOps_IT24102224 as the project root and agentfiles/IT24
 Implemented the initial TCP Agent in agent_224.c and created Makefile_224. Compilation completed without displayed warnings or errors. Verified that the Agent was listening on personalised port 9410 using ss. Two sequential local TCP connections were accepted and closed successfully.
 
 Used this minimal stage to verify socket setup and the accept loop before adding session handling. Captured code and execution screenshots for the Implementation Report. Authentication, command processing, concurrency, file transfers, and UDP monitoring remain pending.
+Initial TCP Controller
+
+Implemented controller_224.c to accept an IPv4 address and connect to the Agent on personalised port 9410. Updated Makefile_224 to build both programs. Verified local connectivity using ./controller 127.0.0.1; the Controller reported a successful connection, and the Agent displayed the corresponding accepted connection.
+
+Kept this stage limited to connection establishment and closure so that basic connectivity could be verified before adding protocol commands. Added execution and annotated code evidence to the Implementation Report.
