@@ -17,3 +17,6 @@ Initial TCP Controller
 Implemented controller_224.c to accept an IPv4 address and connect to the Agent on personalised port 9410. Updated Makefile_224 to build both programs. Verified local connectivity using ./controller 127.0.0.1; the Controller reported a successful connection, and the Agent displayed the corresponding accepted connection.
 
 Kept this stage limited to connection establishment and closure so that basic connectivity could be verified before adding protocol commands. Added execution and annotated code evidence to the Implementation Report.
+TCP Line Framing
+
+Added a buffered line reader that retains unread bytes between calls. Chose a 4096-byte receive buffer and a maximum command-text length of 1023 bytes. Verified reconstruction of an AUTH line sent in two writes and separate parsing of SYSINFO and LISTPROC sent alongside its final fragment. Confirmed orderly peer-disconnection detection and captured report evidence. Command execution and authentication remain pending.

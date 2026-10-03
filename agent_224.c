@@ -8,6 +8,90 @@
 
 #define AGENT_PORT 9410
 #define BACKLOG 10
+#define RECEIVE_CAPACITY 4096
+#define LINE_CAPACITY 1024
+
+struct socket_reader {
+    unsigned char buffer[RECEIVE_CAPACITY];
+    size_t next;
+    size_t available;
+};
+
+
+static int read_line(int fd, struct socket_reader *reader,
+                     char *line, size_t capacity)
+{
+    size_t used = 0;
+
+    for (;;) {
+        if (reader->next == reader->available) {
+            ssize_t received;
+
+            do {
+                received = recv(fd, reader->buffer,
+                                sizeof(reader->buffer), 0);
+            } while (received == -1 && errno == EINTR);
+
+            if (received == -1) {
+                return -1;
+            }
+
+            if (received == 0) {
+                return used == 0 ? 0 : -3;
+            }
+
+            reader->next = 0;
+            reader->available = (size_t)received;
+        }
+
+        unsigned char byte = reader->buffer[reader->next++];
+
+        if (byte == '\n') {
+            line[used] = '\0';
+            return 1;
+        }
+
+        if (byte == '\0') {
+            return -3;
+        }
+
+        if (used >= capacity - 1) {
+            return -2;
+        }
+
+        line[used++] = (char)byte;
+    }
+}
+
+static void handle_connection(int client_fd)
+{
+    struct socket_reader reader = {0};
+    char line[LINE_CAPACITY];
+
+    for (;;) {
+        int result = read_line(client_fd, &reader,
+                               line, sizeof(line));
+
+        if (result == 1) {
+            printf("Complete command line: [%s]\n", line);
+            fflush(stdout);
+            continue;
+        }
+
+        if (result == 0) {
+            printf("Client disconnected\n");
+        } else if (result == -1) {
+            perror("recv");
+        } else if (result == -2) {
+            printf("Connection closed: command line too long\n");
+        } else {
+            printf("Connection closed: incomplete or invalid text line\n");
+        }
+
+        fflush(stdout);
+        break;
+    }
+}
 
 int main(void)
 {
@@ -69,14 +153,19 @@ int main(void)
         if (inet_ntop(AF_INET, &client_addr.sin_addr,
                       client_ip, sizeof(client_ip)) != NULL) {
             printf("Connection accepted from %s:%u\n",
-                   client_ip, (unsigned int)ntohs(client_addr.sin_port));
+                   client_ip,
+                   (unsigned int)ntohs(client_addr.sin_port));
         } else {
             perror("inet_ntop");
             printf("Connection accepted\n");
         }
 
+        fflush(stdout);
+
+        handle_connection(client_fd);
         close(client_fd);
-        printf("Connection closed: command handling is not implemented yet\n");
+
+        printf("Connection closed\n");
         fflush(stdout);
     }
 }

@@ -31,18 +31,26 @@ and file transfers. UDP will carry periodic monitoring statistics.
 
 ## Current Status
 
+## Current Status
+
 The initial TCP Agent and Controller have been implemented.
 
 Verified results:
 - The Agent compiled without displayed warnings or errors.
 - Listening on personalised port 9410 was confirmed using ss.
-- The Agent accepted and closed two sequential local test connections.
+- The Agent accepted two sequential local test connections.
 - The C Controller connected successfully to 127.0.0.1:9410.
-- The Agent displayed the corresponding Controller connection.
+- The buffered reader reconstructed a command sent in two writes
+  and parsed additional newline-terminated commands separately.
+- Orderly peer disconnection was detected.
 
-At this stage, connections are closed without command exchange.
-Authentication, TCP framing, concurrency, command handlers,
-file transfers, UDP monitoring, and logging remain pending.
+The Agent currently prints complete command lines locally.
+It does not authenticate clients, execute commands, or send TCP
+protocol responses. The initial Controller connects and closes.
+
+Authentication, concurrency, command handlers, file transfers,
+UDP monitoring, logging, and complete send handling remain pending.
+The Controller also requires command and response handling.
 
 ## Build and Run
 
