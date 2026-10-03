@@ -88,7 +88,8 @@ Remove both generated executables:
 make -f Makefile_224 clean
 ```
 ##Verified functionality:
-- Authenticated EXEC supports DATE, UPTIME, DISKFREE, HOSTNAME,
-  and WHOAMI, returning single-line results with SID:4222.
-- EXEC LS and EXEC DATE; whoami were rejected with
-  ERR 002 COMMAND_NOT_ALLOWED SID:4222.
+-- Authenticated PUT and GET transfer binary files up to 10 MiB.
+- Files are stored under ./agentfiles/IT24102224/.
+- A 16,384-byte file passed comparison of the original, stored,
+  and downloaded copies using cmp and SHA-256.
+- GET for a missing file returns ERR 005 FILE_NOT_FOUND SID:4222.

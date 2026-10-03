@@ -1,10 +1,13 @@
-#define _POSIX_C_SOURCE 200809L
+#define _GNU_SOURCE
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <errno.h>
 #include <unistd.h>
 #include <string.h>
+#include <ctype.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/sysinfo.h>
 #include <netinet/in.h>
@@ -15,14 +18,45 @@
 #define RECEIVE_CAPACITY 4096
 #define LINE_CAPACITY 1024
 #define PROCESS_LIMIT 20
+#define FILE_LIMIT (10ULL * 1024ULL * 1024ULL)
+#define FILE_CHUNK 4096
 #define AUTH_TOKEN "OPS-2224"
 #define SID_TAG "SID:4222"
+#define STORAGE_ROOT "./agentfiles"
+#define STORAGE_PATH "./agentfiles/IT24102224"
 
 struct socket_reader {
     unsigned char buffer[RECEIVE_CAPACITY];
     size_t next;
     size_t available;
 };
+
+/* Refill only when all buffered bytes have been consumed. */
+static int refill_reader(int fd, struct socket_reader *reader)
+{
+    if (reader->next < reader->available) {
+        return 1;
+    }
+
+    ssize_t received;
+
+    do {
+        received = recv(fd, reader->buffer,
+                        sizeof(reader->buffer), 0);
+    } while (received == -1 && errno == EINTR);
+
+    if (received == -1) {
+        return -1;
+    }
+
+    if (received == 0) {
+        return 0;
+    }
+
+    reader->next = 0;
+    reader->available = (size_t)received;
+    return 1;
+}
 
 /*
  * Returns:
@@ -38,24 +72,14 @@ static int read_line(int fd, struct socket_reader *reader,
     size_t used = 0;
 
     for (;;) {
-        if (reader->next == reader->available) {
-            ssize_t received;
+        int result = refill_reader(fd, reader);
 
-            do {
-                received = recv(fd, reader->buffer,
-                                sizeof(reader->buffer), 0);
-            } while (received == -1 && errno == EINTR);
+        if (result == -1) {
+            return -1;
+        }
 
-            if (received == -1) {
-                return -1;
-            }
-
-            if (received == 0) {
-                return used == 0 ? 0 : -3;
-            }
-
-            reader->next = 0;
-            reader->available = (size_t)received;
+        if (result == 0) {
+            return used == 0 ? 0 : -3;
         }
 
         unsigned char byte = reader->buffer[reader->next++];
@@ -77,6 +101,39 @@ static int read_line(int fd, struct socket_reader *reader,
     }
 }
 
+/*
+ * Read exactly length bytes, consuming buffered bytes first.
+ * Bytes after the requested payload remain for the next command.
+ */
+static int read_exact(int fd, struct socket_reader *reader,
+                      void *destination, size_t length)
+{
+    unsigned char *output = destination;
+    size_t copied = 0;
+
+    while (copied < length) {
+        int result = refill_reader(fd, reader);
+
+        if (result != 1) {
+            return -1;
+        }
+
+        size_t amount = reader->available - reader->next;
+
+        if (amount > length - copied) {
+            amount = length - copied;
+        }
+
+        memcpy(output + copied, reader->buffer + reader->next,
+               amount);
+
+        reader->next += amount;
+        copied += amount;
+    }
+
+    return 0;
+}
+
 static int send_all(int fd, const void *data, size_t length)
 {
     const unsigned char *bytes = data;
@@ -90,7 +147,6 @@ static int send_all(int fd, const void *data, size_t length)
             if (errno == EINTR) {
                 continue;
             }
-
             return -1;
         }
 
@@ -133,8 +189,7 @@ static int handle_sysinfo(int client_fd)
 
     if (sysinfo(&info) == -1) {
         perror("sysinfo");
-        return send_response(client_fd,
-                             "ERR 007 SYSINFO_FAILED");
+        return send_response(client_fd, "ERR 007 SYSINFO_FAILED");
     }
 
     /* One-minute load average, not CPU utilisation percentage. */
@@ -151,8 +206,7 @@ static int handle_sysinfo(int client_fd)
                           cpu_load, mem_used_mb, info.uptime);
 
     if (length < 0 || (size_t)length >= sizeof(message)) {
-        return send_response(client_fd,
-                             "ERR 007 SYSINFO_FAILED");
+        return send_response(client_fd, "ERR 007 SYSINFO_FAILED");
     }
 
     return send_response(client_fd, message);
@@ -166,16 +220,11 @@ static int handle_listproc(int client_fd)
     int failed = 0;
     long pid;
 
-    /*
-     * Fixed command: client input is never passed to the shell.
-     * Return a snapshot of up to PROCESS_LIMIT PIDs.
-     */
     FILE *processes = popen("ps -e -o pid=", "r");
 
     if (processes == NULL) {
         perror("popen");
-        return send_response(client_fd,
-                             "ERR 008 LISTPROC_FAILED");
+        return send_response(client_fd, "ERR 008 LISTPROC_FAILED");
     }
 
     int scan_result;
@@ -193,9 +242,7 @@ static int handle_listproc(int client_fd)
 
         int length = snprintf(message + used,
                               sizeof(message) - used,
-                              "%s%ld",
-                              count == 0 ? "" : ",",
-                              pid);
+                              "%s%ld", count == 0 ? "" : ",", pid);
 
         if (length < 0 ||
             (size_t)length >= sizeof(message) - used) {
@@ -214,8 +261,7 @@ static int handle_listproc(int client_fd)
     int status = pclose(processes);
 
     if (status != 0 || failed || count == 0) {
-        return send_response(client_fd,
-                             "ERR 008 LISTPROC_FAILED");
+        return send_response(client_fd, "ERR 008 LISTPROC_FAILED");
     }
 
     return send_response(client_fd, message);
@@ -225,10 +271,6 @@ static int handle_exec(int client_fd, const char *name)
 {
     const char *command = NULL;
 
-    /*
-     * Exact whitelist matching.
-     * Only these fixed command strings reach popen().
-     */
     if (strcmp(name, "DATE") == 0) {
         command = "date";
     } else if (strcmp(name, "UPTIME") == 0) {
@@ -248,8 +290,7 @@ static int handle_exec(int client_fd, const char *name)
 
     if (pipe == NULL) {
         perror("popen");
-        return send_response(client_fd,
-                             "ERR 009 EXEC_FAILED");
+        return send_response(client_fd, "ERR 009 EXEC_FAILED");
     }
 
     char output[900];
@@ -259,10 +300,6 @@ static int handle_exec(int client_fd, const char *name)
     int byte;
 
     while ((byte = fgetc(pipe)) != EOF) {
-        /*
-         * Flatten multiline output into one protocol line.
-         * Collapse consecutive spaces and omit leading spaces.
-         */
         if (byte == '\n' || byte == '\r' || byte == '\t') {
             byte = ' ';
         }
@@ -289,8 +326,7 @@ static int handle_exec(int client_fd, const char *name)
     int status = pclose(pipe);
 
     if (read_failed || status != 0 || invalid_output) {
-        return send_response(client_fd,
-                             "ERR 009 EXEC_FAILED");
+        return send_response(client_fd, "ERR 009 EXEC_FAILED");
     }
 
     if (too_long) {
@@ -305,8 +341,7 @@ static int handle_exec(int client_fd, const char *name)
     output[used] = '\0';
 
     if (used == 0) {
-        return send_response(client_fd,
-                             "ERR 009 EXEC_FAILED");
+        return send_response(client_fd, "ERR 009 EXEC_FAILED");
     }
 
     char message[LINE_CAPACITY];
@@ -315,11 +350,275 @@ static int handle_exec(int client_fd, const char *name)
                           "OK EXEC_RESULT %s", output);
 
     if (length < 0 || (size_t)length >= sizeof(message)) {
-        return send_response(client_fd,
-                             "ERR 009 EXEC_FAILED");
+        return send_response(client_fd, "ERR 009 EXEC_FAILED");
     }
 
     return send_response(client_fd, message);
+}
+
+/*
+ * Accept simple filenames only.
+ * First character must be a letter or number.
+ * Remaining characters may also include '.', '_' and '-'.
+ */
+static int valid_filename(const char *name)
+{
+    size_t length = strlen(name);
+
+    if (length == 0 || length > 127 ||
+        !isalnum((unsigned char)name[0])) {
+        return 0;
+    }
+
+    for (size_t i = 0; i < length; i++) {
+        unsigned char byte = (unsigned char)name[i];
+
+        if (!isalnum(byte) && byte != '.' &&
+            byte != '_' && byte != '-') {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+static int ensure_directory(const char *path)
+{
+    if (mkdir(path, 0700) == -1 && errno != EEXIST) {
+        perror("mkdir");
+        return -1;
+    }
+
+    struct stat info;
+
+    if (lstat(path, &info) == -1) {
+        perror("lstat");
+        return -1;
+    }
+
+    if (!S_ISDIR(info.st_mode)) {
+        fprintf(stderr, "%s is not a directory\n", path);
+        return -1;
+    }
+
+    return 0;
+}
+
+static int handle_put(int client_fd, struct socket_reader *reader,
+                      const char *arguments)
+{
+    char filename[128];
+    char size_text[32];
+    int consumed = 0;
+
+    if (sscanf(arguments, "%127s %31s %n",
+               filename, size_text, &consumed) != 2 ||
+        arguments[consumed] != '\0') {
+        send_response(client_fd, "ERR 011 INVALID_PUT");
+        return -1;
+    }
+
+    if (!valid_filename(filename)) {
+        send_response(client_fd, "ERR 012 INVALID_FILENAME");
+        return -1;
+    }
+
+    for (size_t i = 0; size_text[i] != '\0'; i++) {
+        if (!isdigit((unsigned char)size_text[i])) {
+            send_response(client_fd, "ERR 011 INVALID_PUT");
+            return -1;
+        }
+    }
+
+    errno = 0;
+    unsigned long long filesize = strtoull(size_text, NULL, 10);
+
+    if (errno == ERANGE || filesize > FILE_LIMIT) {
+        /*
+         * Close after rejection because raw bytes may already
+         * follow the header. Do not parse them as commands.
+         */
+        send_response(client_fd, "ERR 004 FILE_TOO_LARGE");
+        return -1;
+    }
+
+    char path[256];
+    int length = snprintf(path, sizeof(path),
+                          "%s/%s", STORAGE_PATH, filename);
+
+    if (length < 0 || (size_t)length >= sizeof(path)) {
+        send_response(client_fd, "ERR 012 INVALID_FILENAME");
+        return -1;
+    }
+
+    /*
+     * Receive into a temporary file. Publish the final filename
+     * only after every byte has been written successfully.
+     */
+    char temporary[] = STORAGE_PATH "/.uploadXXXXXX";
+    int file_fd = mkstemp(temporary);
+
+    if (file_fd == -1) {
+        perror("mkstemp");
+        send_response(client_fd, "ERR 013 FILE_WRITE_FAILED");
+        return -1;
+    }
+
+    FILE *file = fdopen(file_fd, "wb");
+
+    if (file == NULL) {
+        perror("fdopen");
+        close(file_fd);
+        unlink(temporary);
+        send_response(client_fd, "ERR 013 FILE_WRITE_FAILED");
+        return -1;
+    }
+
+    unsigned char buffer[FILE_CHUNK];
+    unsigned long long remaining = filesize;
+    int transfer_failed = 0;
+
+    while (remaining > 0) {
+        size_t amount = remaining > sizeof(buffer)
+                      ? sizeof(buffer) : (size_t)remaining;
+
+        if (read_exact(client_fd, reader, buffer, amount) == -1) {
+            fprintf(stderr, "Upload interrupted: %s\n", filename);
+            transfer_failed = 1;
+            break;
+        }
+
+        if (fwrite(buffer, 1, amount, file) != amount) {
+            fprintf(stderr, "Upload write failed: %s\n", filename);
+            transfer_failed = 1;
+            break;
+        }
+
+        remaining -= amount;
+    }
+
+    if (fclose(file) == EOF) {
+        transfer_failed = 1;
+    }
+
+    if (transfer_failed) {
+        unlink(temporary);
+        send_response(client_fd, "ERR 013 FILE_WRITE_FAILED");
+        return -1;
+    }
+
+    if (rename(temporary, path) == -1) {
+        perror("rename");
+        unlink(temporary);
+        send_response(client_fd, "ERR 013 FILE_WRITE_FAILED");
+        return -1;
+    }
+
+    printf("Upload stored: %s (%llu bytes)\n", path, filesize);
+    fflush(stdout);
+
+    char message[256];
+    snprintf(message, sizeof(message),
+             "OK FILE_RECEIVED %s", filename);
+
+    return send_response(client_fd, message);
+}
+
+static int handle_get(int client_fd, const char *arguments)
+{
+    char filename[128];
+    int consumed = 0;
+
+    if (sscanf(arguments, "%127s %n",
+               filename, &consumed) != 1 ||
+        arguments[consumed] != '\0') {
+        return send_response(client_fd, "ERR 014 INVALID_GET");
+    }
+
+    if (!valid_filename(filename)) {
+        return send_response(client_fd, "ERR 012 INVALID_FILENAME");
+    }
+
+    char path[256];
+    int length = snprintf(path, sizeof(path),
+                          "%s/%s", STORAGE_PATH, filename);
+
+    if (length < 0 || (size_t)length >= sizeof(path)) {
+        return send_response(client_fd, "ERR 012 INVALID_FILENAME");
+    }
+
+    int file_fd = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+
+    if (file_fd == -1) {
+        if (errno == ENOENT) {
+            return send_response(client_fd,
+                                 "ERR 005 FILE_NOT_FOUND");
+        }
+
+        return send_response(client_fd, "ERR 015 FILE_READ_FAILED");
+    }
+
+    struct stat info;
+
+    if (fstat(file_fd, &info) == -1 ||
+        !S_ISREG(info.st_mode) || info.st_size < 0) {
+        close(file_fd);
+        return send_response(client_fd, "ERR 015 FILE_READ_FAILED");
+    }
+
+    unsigned long long filesize = (unsigned long long)info.st_size;
+
+    if (filesize > FILE_LIMIT) {
+        close(file_fd);
+        return send_response(client_fd, "ERR 004 FILE_TOO_LARGE");
+    }
+
+    char message[256];
+    snprintf(message, sizeof(message),
+             "OK FILE_SEND %s %llu", filename, filesize);
+
+    if (send_response(client_fd, message) == -1) {
+        close(file_fd);
+        return -1;
+    }
+
+    unsigned char buffer[FILE_CHUNK];
+    unsigned long long remaining = filesize;
+
+    while (remaining > 0) {
+        size_t amount = remaining > sizeof(buffer)
+                      ? sizeof(buffer) : (size_t)remaining;
+
+        ssize_t received;
+
+        do {
+            received = read(file_fd, buffer, amount);
+        } while (received == -1 && errno == EINTR);
+
+        if (received <= 0) {
+            /*
+             * Header already sent: close instead of inserting an
+             * error response inside the announced raw payload.
+             */
+            fprintf(stderr, "Download read failed: %s\n", filename);
+            close(file_fd);
+            return -1;
+        }
+
+        if (send_all(client_fd, buffer, (size_t)received) == -1) {
+            perror("send file");
+            close(file_fd);
+            return -1;
+        }
+
+        remaining -= (unsigned long long)received;
+    }
+
+    close(file_fd);
+
+    printf("Download sent: %s (%llu bytes)\n", path, filesize);
+    fflush(stdout);
+    return 0;
 }
 
 static void handle_connection(int client_fd)
@@ -338,11 +637,9 @@ static void handle_connection(int client_fd)
             } else if (result == -1) {
                 perror("recv");
             } else if (result == -2) {
-                send_response(client_fd,
-                              "ERR 006 LINE_TOO_LONG");
+                send_response(client_fd, "ERR 006 LINE_TOO_LONG");
             } else {
-                send_response(client_fd,
-                              "ERR 006 INVALID_LINE");
+                send_response(client_fd, "ERR 006 INVALID_LINE");
             }
 
             fflush(stdout);
@@ -363,6 +660,12 @@ static void handle_connection(int client_fd)
             } else {
                 if (send_response(client_fd,
                                   "ERR 001 AUTH_FAILED") == -1) {
+                    break;
+                }
+
+                /* A rejected PUT may have raw bytes following it. */
+                if (strcmp(line, "PUT") == 0 ||
+                    strncmp(line, "PUT ", 4) == 0) {
                     break;
                 }
             }
@@ -393,7 +696,6 @@ static void handle_connection(int client_fd)
             if (handle_sysinfo(client_fd) == -1) {
                 break;
             }
-
             continue;
         }
 
@@ -401,7 +703,6 @@ static void handle_connection(int client_fd)
             if (handle_listproc(client_fd) == -1) {
                 break;
             }
-
             continue;
         }
 
@@ -413,7 +714,28 @@ static void handle_connection(int client_fd)
             if (handle_exec(client_fd, name) == -1) {
                 break;
             }
+            continue;
+        }
 
+        if (strcmp(line, "PUT") == 0 ||
+            strncmp(line, "PUT ", 4) == 0) {
+            const char *arguments =
+                strcmp(line, "PUT") == 0 ? "" : line + 4;
+
+            if (handle_put(client_fd, &reader, arguments) == -1) {
+                break;
+            }
+            continue;
+        }
+
+        if (strcmp(line, "GET") == 0 ||
+            strncmp(line, "GET ", 4) == 0) {
+            const char *arguments =
+                strcmp(line, "GET") == 0 ? "" : line + 4;
+
+            if (handle_get(client_fd, arguments) == -1) {
+                break;
+            }
             continue;
         }
 
@@ -431,6 +753,11 @@ static void handle_connection(int client_fd)
 
 int main(void)
 {
+    if (ensure_directory(STORAGE_ROOT) == -1 ||
+        ensure_directory(STORAGE_PATH) == -1) {
+        return EXIT_FAILURE;
+    }
+
     int listen_fd;
     int reuse = 1;
     struct sockaddr_in server_addr = {0};
@@ -467,6 +794,7 @@ int main(void)
     }
 
     printf("Agent listening on TCP port %d\n", AGENT_PORT);
+    printf("File storage: %s\n", STORAGE_PATH);
     fflush(stdout);
 
     for (;;) {
@@ -481,7 +809,6 @@ int main(void)
             if (errno == EINTR) {
                 continue;
             }
-
             perror("accept");
             continue;
         }

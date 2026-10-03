@@ -23,3 +23,8 @@ Added a buffered line reader that retains unread bytes between calls. Chose a 40
 Authentication and SID Responses
 Implemented authentication using the personalised token OPS-2224. Authentication state is maintained separately for each connection so that a new connection starts unauthenticated. Centralised response formatting in send_response() to append SID:4222 and the newline delimiter consistently.
 Local TCP tests using a Bash client confirmed rejection of SYSINFO before authentication and rejection of an incorrect token. The correct token returned OK AUTHENTICATED SID:4222. The authenticated QUIT request returned OK BYE SID:4222, and the Agent closed the connection. Saved execution and code screenshots for the Implementation Report.
+For PUT/GET, reused the receive buffer for exact-byte payload reading.
+Set a 10 MiB limit and restricted filenames to prevent directory
+traversal. Uploads use temporary files and are renamed only on
+completion. A 16,384-byte binary transfer passed cmp and SHA-256
+verification; missing-file handling was also tested.
