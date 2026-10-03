@@ -30,28 +30,25 @@ and file transfers. UDP will carry periodic monitoring statistics.
 - Git 2.43.0
 
 ## Current Status
-
-## Current Status
-
 The initial TCP Agent and Controller have been implemented.
 
-Verified results:
-- The Agent compiled without displayed warnings or errors.
-- Listening on personalised port 9410 was confirmed using ss.
-- The Agent accepted two sequential local test connections.
-- The C Controller connected successfully to 127.0.0.1:9410.
-- The buffered reader reconstructed a command sent in two writes
-  and parsed additional newline-terminated commands separately.
-- Orderly peer disconnection was detected.
+Verified functionality:
+- The Agent listens on personalised TCP port 9410.
+- The C Controller connects to the Agent over local TCP.
+- Buffered line framing handles split command input and multiple
+  newline-delimited commands sent together.
+- Commands submitted before authentication are rejected.
+- Incorrect authentication tokens are rejected.
+- AUTH OPS-2224 returns OK AUTHENTICATED SID:4222.
+- Authenticated QUIT returns OK BYE SID:4222 and closes the connection.
 
-The Agent currently prints complete command lines locally.
-It does not authenticate clients, execute commands, or send TCP
-protocol responses. The initial Controller connects and closes.
+Authentication and QUIT were tested using a Bash TCP client.
+The C Controller currently tests connectivity only.
 
-Authentication, concurrency, command handlers, file transfers,
-UDP monitoring, logging, and complete send handling remain pending.
-The Controller also requires command and response handling.
-
+The Agent currently handles one connection at a time.
+Concurrent connections, SYSINFO, LISTPROC, EXEC, file transfers,
+UDP monitoring, and timestamped file logging remain to be implemented.
+Further error-handling and integration tests are also pending.
 ## Build and Run
 
 Run these commands from the project root.

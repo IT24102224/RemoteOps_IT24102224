@@ -20,3 +20,6 @@ Kept this stage limited to connection establishment and closure so that basic co
 TCP Line Framing
 
 Added a buffered line reader that retains unread bytes between calls. Chose a 4096-byte receive buffer and a maximum command-text length of 1023 bytes. Verified reconstruction of an AUTH line sent in two writes and separate parsing of SYSINFO and LISTPROC sent alongside its final fragment. Confirmed orderly peer-disconnection detection and captured report evidence. Command execution and authentication remain pending.
+Authentication and SID Responses
+Implemented authentication using the personalised token OPS-2224. Authentication state is maintained separately for each connection so that a new connection starts unauthenticated. Centralised response formatting in send_response() to append SID:4222 and the newline delimiter consistently.
+Local TCP tests using a Bash client confirmed rejection of SYSINFO before authentication and rejection of an incorrect token. The correct token returned OK AUTHENTICATED SID:4222. The authenticated QUIT request returned OK BYE SID:4222, and the Agent closed the connection. Saved execution and code screenshots for the Implementation Report.
