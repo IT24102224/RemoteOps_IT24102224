@@ -7,6 +7,8 @@
 #include <string.h>
 #include <ctype.h>
 #include <fcntl.h>
+#include <signal.h>
+#include <sys/wait.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/sysinfo.h>
@@ -31,7 +33,53 @@ struct socket_reader {
     size_t available;
 };
 
-/* Refill only when all buffered bytes have been consumed. */
+/* Parent reaps finished connection processes to prevent zombies. */
+static void reap_children(int signal_number)
+{
+    int saved_errno = errno;
+    (void)signal_number;
+
+    while (waitpid(-1, NULL, WNOHANG) > 0) {
+    }
+
+    errno = saved_errno;
+}
+
+static int install_child_reaper(void)
+{
+    struct sigaction action = {0};
+
+    action.sa_handler = reap_children;
+    action.sa_flags = SA_RESTART | SA_NOCLDSTOP;
+    sigemptyset(&action.sa_mask);
+
+    if (sigaction(SIGCHLD, &action, NULL) == -1) {
+        perror("sigaction");
+        return -1;
+    }
+
+    return 0;
+}
+
+/*
+ * Connection children must use default SIGCHLD handling.
+ * This lets pclose() wait for its own command subprocesses.
+ */
+static int reset_child_signal(void)
+{
+    struct sigaction action = {0};
+
+    action.sa_handler = SIG_DFL;
+    sigemptyset(&action.sa_mask);
+
+    if (sigaction(SIGCHLD, &action, NULL) == -1) {
+        perror("sigaction");
+        return -1;
+    }
+
+    return 0;
+}
+
 static int refill_reader(int fd, struct socket_reader *reader)
 {
     if (reader->next < reader->available) {
@@ -101,10 +149,7 @@ static int read_line(int fd, struct socket_reader *reader,
     }
 }
 
-/*
- * Read exactly length bytes, consuming buffered bytes first.
- * Bytes after the requested payload remain for the next command.
- */
+/* Consume buffered bytes first; retain bytes after this payload. */
 static int read_exact(int fd, struct socket_reader *reader,
                       void *destination, size_t length)
 {
@@ -177,7 +222,8 @@ static int send_response(int fd, const char *message)
         return -1;
     }
 
-    printf("Response sent: %s", response);
+    printf("[PID %ld] Response sent: %s",
+           (long)getpid(), response);
     fflush(stdout);
     return 0;
 }
@@ -235,7 +281,6 @@ static int handle_listproc(int client_fd)
             continue;
         }
 
-        /* Drain remaining output before pclose(). */
         if (count >= PROCESS_LIMIT || failed) {
             continue;
         }
@@ -356,11 +401,6 @@ static int handle_exec(int client_fd, const char *name)
     return send_response(client_fd, message);
 }
 
-/*
- * Accept simple filenames only.
- * First character must be a letter or number.
- * Remaining characters may also include '.', '_' and '-'.
- */
 static int valid_filename(const char *name)
 {
     size_t length = strlen(name);
@@ -434,10 +474,6 @@ static int handle_put(int client_fd, struct socket_reader *reader,
     unsigned long long filesize = strtoull(size_text, NULL, 10);
 
     if (errno == ERANGE || filesize > FILE_LIMIT) {
-        /*
-         * Close after rejection because raw bytes may already
-         * follow the header. Do not parse them as commands.
-         */
         send_response(client_fd, "ERR 004 FILE_TOO_LARGE");
         return -1;
     }
@@ -451,15 +487,12 @@ static int handle_put(int client_fd, struct socket_reader *reader,
         return -1;
     }
 
-    /*
-     * Receive into a temporary file. Publish the final filename
-     * only after every byte has been written successfully.
-     */
+    /* Each upload receives its own unique temporary file. */
     char temporary[] = STORAGE_PATH "/.uploadXXXXXX";
-    int file_fd = mkstemp(temporary);
+    int file_fd = mkostemp(temporary, O_CLOEXEC);
 
     if (file_fd == -1) {
-        perror("mkstemp");
+        perror("mkostemp");
         send_response(client_fd, "ERR 013 FILE_WRITE_FAILED");
         return -1;
     }
@@ -514,7 +547,8 @@ static int handle_put(int client_fd, struct socket_reader *reader,
         return -1;
     }
 
-    printf("Upload stored: %s (%llu bytes)\n", path, filesize);
+    printf("[PID %ld] Upload stored: %s (%llu bytes)\n",
+           (long)getpid(), path, filesize);
     fflush(stdout);
 
     char message[256];
@@ -547,7 +581,8 @@ static int handle_get(int client_fd, const char *arguments)
         return send_response(client_fd, "ERR 012 INVALID_FILENAME");
     }
 
-    int file_fd = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+    int file_fd = open(path, O_RDONLY | O_NOFOLLOW |
+                       O_NONBLOCK | O_CLOEXEC);
 
     if (file_fd == -1) {
         if (errno == ENOENT) {
@@ -596,10 +631,6 @@ static int handle_get(int client_fd, const char *arguments)
         } while (received == -1 && errno == EINTR);
 
         if (received <= 0) {
-            /*
-             * Header already sent: close instead of inserting an
-             * error response inside the announced raw payload.
-             */
             fprintf(stderr, "Download read failed: %s\n", filename);
             close(file_fd);
             return -1;
@@ -616,7 +647,8 @@ static int handle_get(int client_fd, const char *arguments)
 
     close(file_fd);
 
-    printf("Download sent: %s (%llu bytes)\n", path, filesize);
+    printf("[PID %ld] Download sent: %s (%llu bytes)\n",
+           (long)getpid(), path, filesize);
     fflush(stdout);
     return 0;
 }
@@ -633,7 +665,8 @@ static void handle_connection(int client_fd)
 
         if (result != 1) {
             if (result == 0) {
-                printf("Client disconnected\n");
+                printf("[PID %ld] Client disconnected\n",
+                       (long)getpid());
             } else if (result == -1) {
                 perror("recv");
             } else if (result == -2) {
@@ -646,7 +679,8 @@ static void handle_connection(int client_fd)
             break;
         }
 
-        printf("Complete command line: [%s]\n", line);
+        printf("[PID %ld] Complete command line: [%s]\n",
+               (long)getpid(), line);
         fflush(stdout);
 
         if (!authenticated) {
@@ -663,7 +697,6 @@ static void handle_connection(int client_fd)
                     break;
                 }
 
-                /* A rejected PUT may have raw bytes following it. */
                 if (strcmp(line, "PUT") == 0 ||
                     strncmp(line, "PUT ", 4) == 0) {
                     break;
@@ -758,11 +791,15 @@ int main(void)
         return EXIT_FAILURE;
     }
 
-    int listen_fd;
+    if (install_child_reaper() == -1) {
+        return EXIT_FAILURE;
+    }
+
     int reuse = 1;
     struct sockaddr_in server_addr = {0};
 
-    listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    int listen_fd = socket(AF_INET,
+                           SOCK_STREAM | SOCK_CLOEXEC, 0);
 
     if (listen_fd == -1) {
         perror("socket");
@@ -795,42 +832,76 @@ int main(void)
 
     printf("Agent listening on TCP port %d\n", AGENT_PORT);
     printf("File storage: %s\n", STORAGE_PATH);
+    printf("Concurrency model: fork per connection\n");
+    printf("Parent PID: %ld\n", (long)getpid());
     fflush(stdout);
 
     for (;;) {
         struct sockaddr_in client_addr = {0};
         socklen_t client_len = sizeof(client_addr);
 
-        int client_fd = accept(listen_fd,
-                               (struct sockaddr *)&client_addr,
-                               &client_len);
+        int client_fd = accept4(listen_fd,
+                                (struct sockaddr *)&client_addr,
+                                &client_len, SOCK_CLOEXEC);
 
         if (client_fd == -1) {
             if (errno == EINTR) {
                 continue;
             }
-            perror("accept");
+            perror("accept4");
             continue;
         }
 
-        char client_ip[INET_ADDRSTRLEN];
+        /* Flush stdio before fork to avoid duplicated output. */
+        fflush(NULL);
 
-        if (inet_ntop(AF_INET, &client_addr.sin_addr,
-                      client_ip, sizeof(client_ip)) != NULL) {
-            printf("Connection accepted from %s:%u\n",
-                   client_ip,
-                   (unsigned int)ntohs(client_addr.sin_port));
-        } else {
-            perror("inet_ntop");
-            printf("Connection accepted\n");
+        pid_t child_pid = fork();
+
+        if (child_pid == -1) {
+            perror("fork");
+            send_response(client_fd, "ERR 016 SERVER_BUSY");
+            close(client_fd);
+            continue;
         }
 
-        fflush(stdout);
+        if (child_pid == 0) {
+            /* Child serves this connection only. */
+            close(listen_fd);
 
-        handle_connection(client_fd);
+            if (reset_child_signal() == -1) {
+                close(client_fd);
+                _exit(EXIT_FAILURE);
+            }
+
+            char client_ip[INET_ADDRSTRLEN];
+
+            if (inet_ntop(AF_INET, &client_addr.sin_addr,
+                          client_ip, sizeof(client_ip)) != NULL) {
+                printf("[PID %ld] Connection accepted from %s:%u\n",
+                       (long)getpid(), client_ip,
+                       (unsigned int)ntohs(client_addr.sin_port));
+            } else {
+                perror("inet_ntop");
+                printf("[PID %ld] Connection accepted\n",
+                       (long)getpid());
+            }
+
+            fflush(stdout);
+
+            handle_connection(client_fd);
+            close(client_fd);
+
+            printf("[PID %ld] Connection closed\n",
+                   (long)getpid());
+            fflush(stdout);
+            _exit(EXIT_SUCCESS);
+        }
+
+        /* Parent keeps accepting; it does not serve this socket. */
         close(client_fd);
 
-        printf("Connection closed\n");
+        printf("Started connection child PID: %ld\n",
+               (long)child_pid);
         fflush(stdout);
     }
 }

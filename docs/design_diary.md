@@ -28,3 +28,8 @@ Set a 10 MiB limit and restricted filenames to prevent directory
 traversal. Uploads use temporary files and are renamed only on
 completion. A 16,384-byte binary transfer passed cmp and SHA-256
 verification; missing-file handling was also tested.
+ oct 4
+Selected fork-per-connection concurrency to isolate blocking session
+operations and authentication state. The parent reaps connection
+children; each child resets SIGCHLD handling for popen()/pclose().
+Tested AUTH and SYSINFO with five connections held open together.
