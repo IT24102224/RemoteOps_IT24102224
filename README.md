@@ -30,8 +30,8 @@ and file transfers. UDP will carry periodic monitoring statistics.
 - Git 2.43.0
 
 ##Verified functionality:
-- MONITOR START sends SID-tagged UDP system statistics every
-  two seconds to the client's IP and requested UDP port.
-- MONITOR STOP stops the stream while TCP commands remain usable.
-- QUIT stops active monitoring and closes the TCP connection.
-- Monitoring was tested using a Bash TCP client and Netcat UDP receiver.
+- Timestamped connection, command, response, and file-transfer logging
+  in remoteops_IT24102224.log, including PID and SID:4222.
+- Authentication tokens are redacted in logs.
+- flock() serialises concurrent log writes.
+- Client EOF is logged and the Agent continues serving new connections.

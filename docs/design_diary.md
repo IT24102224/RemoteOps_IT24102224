@@ -38,3 +38,10 @@ while the TCP handler waits for commands. Selected a two-second
 interval using a monotonic clock. STOP and QUIT signal and join the
 thread before closing its UDP socket. Verified START, STOP, continued
 TCP operation, and cleanup on QUIT.
+oct 5
+Added timestamped append-only logging to remoteops_IT24102224.log.
+Used flock() to serialise writes across connection processes and
+threads. Recorded connection events, commands, responses, and transfer
+start/completion details while redacting authentication tokens.
+Verified command and transfer logs, and confirmed that client EOF
+does not prevent subsequent connections.
