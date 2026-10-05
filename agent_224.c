@@ -8,6 +8,8 @@
 #include <ctype.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <pthread.h>
+#include <time.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
@@ -22,6 +24,7 @@
 #define PROCESS_LIMIT 20
 #define FILE_LIMIT (10ULL * 1024ULL * 1024ULL)
 #define FILE_CHUNK 4096
+#define MONITOR_INTERVAL 2
 #define AUTH_TOKEN "OPS-2224"
 #define SID_TAG "SID:4222"
 #define STORAGE_ROOT "./agentfiles"
@@ -33,7 +36,16 @@ struct socket_reader {
     size_t available;
 };
 
-/* Parent reaps finished connection processes to prevent zombies. */
+struct monitor_state {
+    pthread_t thread;
+    pthread_mutex_t mutex;
+    pthread_cond_t condition;
+    int running;
+    int stop;
+    int udp_fd;
+    struct sockaddr_in destination;
+};
+
 static void reap_children(int signal_number)
 {
     int saved_errno = errno;
@@ -48,7 +60,6 @@ static void reap_children(int signal_number)
 static int install_child_reaper(void)
 {
     struct sigaction action = {0};
-
     action.sa_handler = reap_children;
     action.sa_flags = SA_RESTART | SA_NOCLDSTOP;
     sigemptyset(&action.sa_mask);
@@ -57,18 +68,12 @@ static int install_child_reaper(void)
         perror("sigaction");
         return -1;
     }
-
     return 0;
 }
 
-/*
- * Connection children must use default SIGCHLD handling.
- * This lets pclose() wait for its own command subprocesses.
- */
 static int reset_child_signal(void)
 {
     struct sigaction action = {0};
-
     action.sa_handler = SIG_DFL;
     sigemptyset(&action.sa_mask);
 
@@ -76,7 +81,6 @@ static int reset_child_signal(void)
         perror("sigaction");
         return -1;
     }
-
     return 0;
 }
 
@@ -87,7 +91,6 @@ static int refill_reader(int fd, struct socket_reader *reader)
     }
 
     ssize_t received;
-
     do {
         received = recv(fd, reader->buffer,
                         sizeof(reader->buffer), 0);
@@ -96,7 +99,6 @@ static int refill_reader(int fd, struct socket_reader *reader)
     if (received == -1) {
         return -1;
     }
-
     if (received == 0) {
         return 0;
     }
@@ -106,14 +108,7 @@ static int refill_reader(int fd, struct socket_reader *reader)
     return 1;
 }
 
-/*
- * Returns:
- *  1: complete line
- *  0: clean end of stream
- * -1: receive error
- * -2: line too long
- * -3: incomplete or invalid text line
- */
+/* 1=line, 0=EOF, -1=recv error, -2=too long, -3=invalid line. */
 static int read_line(int fd, struct socket_reader *reader,
                      char *line, size_t capacity)
 {
@@ -121,11 +116,9 @@ static int read_line(int fd, struct socket_reader *reader,
 
     for (;;) {
         int result = refill_reader(fd, reader);
-
         if (result == -1) {
             return -1;
         }
-
         if (result == 0) {
             return used == 0 ? 0 : -3;
         }
@@ -136,20 +129,16 @@ static int read_line(int fd, struct socket_reader *reader,
             line[used] = '\0';
             return 1;
         }
-
         if (byte == '\0') {
             return -3;
         }
-
         if (used >= capacity - 1) {
             return -2;
         }
-
         line[used++] = (char)byte;
     }
 }
 
-/* Consume buffered bytes first; retain bytes after this payload. */
 static int read_exact(int fd, struct socket_reader *reader,
                       void *destination, size_t length)
 {
@@ -157,25 +146,20 @@ static int read_exact(int fd, struct socket_reader *reader,
     size_t copied = 0;
 
     while (copied < length) {
-        int result = refill_reader(fd, reader);
-
-        if (result != 1) {
+        if (refill_reader(fd, reader) != 1) {
             return -1;
         }
 
         size_t amount = reader->available - reader->next;
-
         if (amount > length - copied) {
             amount = length - copied;
         }
 
-        memcpy(output + copied, reader->buffer + reader->next,
-               amount);
-
+        memcpy(output + copied,
+               reader->buffer + reader->next, amount);
         reader->next += amount;
         copied += amount;
     }
-
     return 0;
 }
 
@@ -187,28 +171,23 @@ static int send_all(int fd, const void *data, size_t length)
     while (sent < length) {
         ssize_t result = send(fd, bytes + sent,
                               length - sent, MSG_NOSIGNAL);
-
         if (result == -1) {
             if (errno == EINTR) {
                 continue;
             }
             return -1;
         }
-
         if (result == 0) {
             return -1;
         }
-
         sent += (size_t)result;
     }
-
     return 0;
 }
 
 static int send_response(int fd, const char *message)
 {
     char response[LINE_CAPACITY];
-
     int length = snprintf(response, sizeof(response),
                           "%s %s\n", message, SID_TAG);
 
@@ -216,7 +195,6 @@ static int send_response(int fd, const char *message)
         fprintf(stderr, "Response formatting failed\n");
         return -1;
     }
-
     if (send_all(fd, response, (size_t)length) == -1) {
         perror("send");
         return -1;
@@ -228,34 +206,232 @@ static int send_response(int fd, const char *message)
     return 0;
 }
 
-static int handle_sysinfo(int client_fd)
+/* Shared statistics formatting for TCP SYSINFO and UDP monitoring. */
+static int format_statistics(char *message, size_t capacity,
+                             const char *prefix)
 {
     struct sysinfo info;
-    char message[256];
 
     if (sysinfo(&info) == -1) {
-        perror("sysinfo");
-        return send_response(client_fd, "ERR 007 SYSINFO_FAILED");
+        return -1;
     }
 
-    /* One-minute load average, not CPU utilisation percentage. */
-    double cpu_load =
+    double load =
         (double)info.loads[0] / (double)(1UL << SI_LOAD_SHIFT);
 
-    /* Non-free RAM, including buffers and cache. */
-    double mem_used_mb =
+    double memory =
         ((double)info.totalram - (double)info.freeram) *
         (double)info.mem_unit / (1024.0 * 1024.0);
 
-    int length = snprintf(message, sizeof(message),
-                          "OK SYSINFO %.2f %.2f %ld",
-                          cpu_load, mem_used_mb, info.uptime);
+    int length = snprintf(message, capacity,
+                          "%s %.2f %.2f %ld",
+                          prefix, load, memory, info.uptime);
 
-    if (length < 0 || (size_t)length >= sizeof(message)) {
+    if (length < 0 || (size_t)length >= capacity) {
+        return -1;
+    }
+    return 0;
+}
+
+static int handle_sysinfo(int client_fd)
+{
+    char message[256];
+
+    if (format_statistics(message, sizeof(message),
+                          "OK SYSINFO") == -1) {
         return send_response(client_fd, "ERR 007 SYSINFO_FAILED");
     }
-
     return send_response(client_fd, message);
+}
+
+/*
+ * The monitor thread sends UDP only.
+ * All TCP responses remain owned by the connection handler.
+ */
+static void *monitor_loop(void *argument)
+{
+    struct monitor_state *monitor = argument;
+    pthread_mutex_lock(&monitor->mutex);
+
+    while (!monitor->stop) {
+        char statistics[256];
+        char datagram[320];
+
+        if (format_statistics(statistics, sizeof(statistics),
+                              "SYSINFO") == 0) {
+            int length = snprintf(datagram, sizeof(datagram),
+                                  "%s %s\n", statistics, SID_TAG);
+
+            if (length > 0 &&
+                (size_t)length < sizeof(datagram)) {
+                ssize_t sent;
+                do {
+                    sent = sendto(
+                        monitor->udp_fd, datagram, (size_t)length,
+                        MSG_NOSIGNAL,
+                        (struct sockaddr *)&monitor->destination,
+                        sizeof(monitor->destination));
+                } while (sent == -1 && errno == EINTR);
+
+                if (sent == -1) {
+                    perror("sendto");
+                } else if (sent != length) {
+                    fprintf(stderr, "Incomplete UDP datagram\n");
+                } else {
+                    printf("[PID %ld] UDP sent: %s",
+                           (long)getpid(), datagram);
+                    fflush(stdout);
+                }
+            }
+        } else {
+            fprintf(stderr, "Monitoring statistics unavailable\n");
+        }
+
+        struct timespec deadline;
+        if (clock_gettime(CLOCK_MONOTONIC, &deadline) == -1) {
+            perror("clock_gettime");
+            break;
+        }
+        deadline.tv_sec += MONITOR_INTERVAL;
+
+        while (!monitor->stop) {
+            int result = pthread_cond_timedwait(
+                &monitor->condition, &monitor->mutex, &deadline);
+
+            if (result == ETIMEDOUT) {
+                break;
+            }
+            if (result != 0) {
+                fprintf(stderr, "Monitor wait: %s\n",
+                        strerror(result));
+                monitor->stop = 1;
+                break;
+            }
+        }
+    }
+
+    pthread_mutex_unlock(&monitor->mutex);
+    return NULL;
+}
+
+static int init_monitor(struct monitor_state *monitor)
+{
+    memset(monitor, 0, sizeof(*monitor));
+    monitor->udp_fd = -1;
+
+    int result = pthread_mutex_init(&monitor->mutex, NULL);
+    if (result != 0) {
+        return -1;
+    }
+
+    pthread_condattr_t attributes;
+    result = pthread_condattr_init(&attributes);
+    if (result != 0) {
+        pthread_mutex_destroy(&monitor->mutex);
+        return -1;
+    }
+
+    result = pthread_condattr_setclock(&attributes, CLOCK_MONOTONIC);
+    if (result == 0) {
+        result = pthread_cond_init(&monitor->condition, &attributes);
+    }
+
+    pthread_condattr_destroy(&attributes);
+
+    if (result != 0) {
+        pthread_mutex_destroy(&monitor->mutex);
+        return -1;
+    }
+    return 0;
+}
+
+static void stop_monitor(struct monitor_state *monitor)
+{
+    if (!monitor->running) {
+        return;
+    }
+
+    pthread_mutex_lock(&monitor->mutex);
+    monitor->stop = 1;
+    pthread_cond_signal(&monitor->condition);
+    pthread_mutex_unlock(&monitor->mutex);
+
+    pthread_join(monitor->thread, NULL);
+    close(monitor->udp_fd);
+    monitor->udp_fd = -1;
+    monitor->running = 0;
+
+    printf("[PID %ld] Monitoring stopped\n", (long)getpid());
+    fflush(stdout);
+}
+
+static int start_monitor(int client_fd,
+                         struct monitor_state *monitor,
+                         const char *port_text)
+{
+    if (*port_text == '\0') {
+        return send_response(client_fd,
+                             "ERR 017 INVALID_UDP_PORT");
+    }
+
+    for (size_t i = 0; port_text[i] != '\0'; i++) {
+        if (!isdigit((unsigned char)port_text[i])) {
+            return send_response(client_fd,
+                                 "ERR 017 INVALID_UDP_PORT");
+        }
+    }
+
+    errno = 0;
+    unsigned long port = strtoul(port_text, NULL, 10);
+    if (errno == ERANGE || port == 0 || port > 65535) {
+        return send_response(client_fd,
+                             "ERR 017 INVALID_UDP_PORT");
+    }
+
+    struct sockaddr_in destination = {0};
+    socklen_t address_length = sizeof(destination);
+
+    if (getpeername(client_fd,
+                    (struct sockaddr *)&destination,
+                    &address_length) == -1) {
+        return send_response(client_fd,
+                             "ERR 018 MONITOR_FAILED");
+    }
+
+    destination.sin_port = htons((unsigned short)port);
+
+    int udp_fd = socket(AF_INET,
+                        SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK,
+                        0);
+    if (udp_fd == -1) {
+        perror("UDP socket");
+        return send_response(client_fd,
+                             "ERR 018 MONITOR_FAILED");
+    }
+
+    /* A repeated START replaces this session's previous stream. */
+    stop_monitor(monitor);
+    monitor->udp_fd = udp_fd;
+    monitor->destination = destination;
+    monitor->stop = 0;
+
+    int result = pthread_create(&monitor->thread, NULL,
+                                monitor_loop, monitor);
+    if (result != 0) {
+        fprintf(stderr, "pthread_create: %s\n", strerror(result));
+        close(udp_fd);
+        monitor->udp_fd = -1;
+        return send_response(client_fd,
+                             "ERR 018 MONITOR_FAILED");
+    }
+
+    monitor->running = 1;
+
+    printf("[PID %ld] Monitoring started on client UDP port %lu\n",
+           (long)getpid(), port);
+    fflush(stdout);
+
+    return send_response(client_fd, "OK MONITOR_STARTED");
 }
 
 static int handle_listproc(int client_fd)
@@ -267,20 +443,16 @@ static int handle_listproc(int client_fd)
     long pid;
 
     FILE *processes = popen("ps -e -o pid=", "r");
-
     if (processes == NULL) {
-        perror("popen");
         return send_response(client_fd, "ERR 008 LISTPROC_FAILED");
     }
 
     int scan_result;
-
     while ((scan_result = fscanf(processes, "%ld", &pid)) == 1) {
         if (pid <= 0) {
             failed = 1;
             continue;
         }
-
         if (count >= PROCESS_LIMIT || failed) {
             continue;
         }
@@ -288,13 +460,11 @@ static int handle_listproc(int client_fd)
         int length = snprintf(message + used,
                               sizeof(message) - used,
                               "%s%ld", count == 0 ? "" : ",", pid);
-
         if (length < 0 ||
             (size_t)length >= sizeof(message) - used) {
             failed = 1;
             continue;
         }
-
         used += (size_t)length;
         count++;
     }
@@ -304,11 +474,9 @@ static int handle_listproc(int client_fd)
     }
 
     int status = pclose(processes);
-
     if (status != 0 || failed || count == 0) {
         return send_response(client_fd, "ERR 008 LISTPROC_FAILED");
     }
-
     return send_response(client_fd, message);
 }
 
@@ -332,9 +500,7 @@ static int handle_exec(int client_fd, const char *name)
     }
 
     FILE *pipe = popen(command, "r");
-
     if (pipe == NULL) {
-        perror("popen");
         return send_response(client_fd, "ERR 009 EXEC_FAILED");
     }
 
@@ -348,32 +514,26 @@ static int handle_exec(int client_fd, const char *name)
         if (byte == '\n' || byte == '\r' || byte == '\t') {
             byte = ' ';
         }
-
         if (byte == '\0' || byte < 32 || byte == 127) {
             invalid_output = 1;
             continue;
         }
-
         if (byte == ' ' &&
             (used == 0 || output[used - 1] == ' ')) {
             continue;
         }
-
         if (used >= sizeof(output) - 1) {
             too_long = 1;
             continue;
         }
-
         output[used++] = (char)byte;
     }
 
     int read_failed = ferror(pipe);
     int status = pclose(pipe);
-
     if (read_failed || status != 0 || invalid_output) {
         return send_response(client_fd, "ERR 009 EXEC_FAILED");
     }
-
     if (too_long) {
         return send_response(client_fd,
                              "ERR 010 EXEC_OUTPUT_TOO_LONG");
@@ -382,7 +542,6 @@ static int handle_exec(int client_fd, const char *name)
     while (used > 0 && output[used - 1] == ' ') {
         used--;
     }
-
     output[used] = '\0';
 
     if (used == 0) {
@@ -390,21 +549,17 @@ static int handle_exec(int client_fd, const char *name)
     }
 
     char message[LINE_CAPACITY];
-
     int length = snprintf(message, sizeof(message),
                           "OK EXEC_RESULT %s", output);
-
     if (length < 0 || (size_t)length >= sizeof(message)) {
         return send_response(client_fd, "ERR 009 EXEC_FAILED");
     }
-
     return send_response(client_fd, message);
 }
 
 static int valid_filename(const char *name)
 {
     size_t length = strlen(name);
-
     if (length == 0 || length > 127 ||
         !isalnum((unsigned char)name[0])) {
         return 0;
@@ -412,13 +567,11 @@ static int valid_filename(const char *name)
 
     for (size_t i = 0; i < length; i++) {
         unsigned char byte = (unsigned char)name[i];
-
         if (!isalnum(byte) && byte != '.' &&
             byte != '_' && byte != '-') {
             return 0;
         }
     }
-
     return 1;
 }
 
@@ -430,17 +583,14 @@ static int ensure_directory(const char *path)
     }
 
     struct stat info;
-
     if (lstat(path, &info) == -1) {
         perror("lstat");
         return -1;
     }
-
     if (!S_ISDIR(info.st_mode)) {
         fprintf(stderr, "%s is not a directory\n", path);
         return -1;
     }
-
     return 0;
 }
 
@@ -457,7 +607,6 @@ static int handle_put(int client_fd, struct socket_reader *reader,
         send_response(client_fd, "ERR 011 INVALID_PUT");
         return -1;
     }
-
     if (!valid_filename(filename)) {
         send_response(client_fd, "ERR 012 INVALID_FILENAME");
         return -1;
@@ -472,7 +621,6 @@ static int handle_put(int client_fd, struct socket_reader *reader,
 
     errno = 0;
     unsigned long long filesize = strtoull(size_text, NULL, 10);
-
     if (errno == ERANGE || filesize > FILE_LIMIT) {
         send_response(client_fd, "ERR 004 FILE_TOO_LARGE");
         return -1;
@@ -481,26 +629,20 @@ static int handle_put(int client_fd, struct socket_reader *reader,
     char path[256];
     int length = snprintf(path, sizeof(path),
                           "%s/%s", STORAGE_PATH, filename);
-
     if (length < 0 || (size_t)length >= sizeof(path)) {
         send_response(client_fd, "ERR 012 INVALID_FILENAME");
         return -1;
     }
 
-    /* Each upload receives its own unique temporary file. */
     char temporary[] = STORAGE_PATH "/.uploadXXXXXX";
     int file_fd = mkostemp(temporary, O_CLOEXEC);
-
     if (file_fd == -1) {
-        perror("mkostemp");
         send_response(client_fd, "ERR 013 FILE_WRITE_FAILED");
         return -1;
     }
 
     FILE *file = fdopen(file_fd, "wb");
-
     if (file == NULL) {
-        perror("fdopen");
         close(file_fd);
         unlink(temporary);
         send_response(client_fd, "ERR 013 FILE_WRITE_FAILED");
@@ -515,33 +657,23 @@ static int handle_put(int client_fd, struct socket_reader *reader,
         size_t amount = remaining > sizeof(buffer)
                       ? sizeof(buffer) : (size_t)remaining;
 
-        if (read_exact(client_fd, reader, buffer, amount) == -1) {
-            fprintf(stderr, "Upload interrupted: %s\n", filename);
+        if (read_exact(client_fd, reader, buffer, amount) == -1 ||
+            fwrite(buffer, 1, amount, file) != amount) {
             transfer_failed = 1;
             break;
         }
-
-        if (fwrite(buffer, 1, amount, file) != amount) {
-            fprintf(stderr, "Upload write failed: %s\n", filename);
-            transfer_failed = 1;
-            break;
-        }
-
         remaining -= amount;
     }
 
     if (fclose(file) == EOF) {
         transfer_failed = 1;
     }
-
     if (transfer_failed) {
         unlink(temporary);
         send_response(client_fd, "ERR 013 FILE_WRITE_FAILED");
         return -1;
     }
-
     if (rename(temporary, path) == -1) {
-        perror("rename");
         unlink(temporary);
         send_response(client_fd, "ERR 013 FILE_WRITE_FAILED");
         return -1;
@@ -554,7 +686,6 @@ static int handle_put(int client_fd, struct socket_reader *reader,
     char message[256];
     snprintf(message, sizeof(message),
              "OK FILE_RECEIVED %s", filename);
-
     return send_response(client_fd, message);
 }
 
@@ -563,12 +694,10 @@ static int handle_get(int client_fd, const char *arguments)
     char filename[128];
     int consumed = 0;
 
-    if (sscanf(arguments, "%127s %n",
-               filename, &consumed) != 1 ||
+    if (sscanf(arguments, "%127s %n", filename, &consumed) != 1 ||
         arguments[consumed] != '\0') {
         return send_response(client_fd, "ERR 014 INVALID_GET");
     }
-
     if (!valid_filename(filename)) {
         return send_response(client_fd, "ERR 012 INVALID_FILENAME");
     }
@@ -576,25 +705,21 @@ static int handle_get(int client_fd, const char *arguments)
     char path[256];
     int length = snprintf(path, sizeof(path),
                           "%s/%s", STORAGE_PATH, filename);
-
     if (length < 0 || (size_t)length >= sizeof(path)) {
         return send_response(client_fd, "ERR 012 INVALID_FILENAME");
     }
 
     int file_fd = open(path, O_RDONLY | O_NOFOLLOW |
                        O_NONBLOCK | O_CLOEXEC);
-
     if (file_fd == -1) {
         if (errno == ENOENT) {
             return send_response(client_fd,
                                  "ERR 005 FILE_NOT_FOUND");
         }
-
         return send_response(client_fd, "ERR 015 FILE_READ_FAILED");
     }
 
     struct stat info;
-
     if (fstat(file_fd, &info) == -1 ||
         !S_ISREG(info.st_mode) || info.st_size < 0) {
         close(file_fd);
@@ -602,7 +727,6 @@ static int handle_get(int client_fd, const char *arguments)
     }
 
     unsigned long long filesize = (unsigned long long)info.st_size;
-
     if (filesize > FILE_LIMIT) {
         close(file_fd);
         return send_response(client_fd, "ERR 004 FILE_TOO_LARGE");
@@ -611,7 +735,6 @@ static int handle_get(int client_fd, const char *arguments)
     char message[256];
     snprintf(message, sizeof(message),
              "OK FILE_SEND %s %llu", filename, filesize);
-
     if (send_response(client_fd, message) == -1) {
         close(file_fd);
         return -1;
@@ -625,28 +748,19 @@ static int handle_get(int client_fd, const char *arguments)
                       ? sizeof(buffer) : (size_t)remaining;
 
         ssize_t received;
-
         do {
             received = read(file_fd, buffer, amount);
         } while (received == -1 && errno == EINTR);
 
-        if (received <= 0) {
-            fprintf(stderr, "Download read failed: %s\n", filename);
+        if (received <= 0 ||
+            send_all(client_fd, buffer, (size_t)received) == -1) {
             close(file_fd);
             return -1;
         }
-
-        if (send_all(client_fd, buffer, (size_t)received) == -1) {
-            perror("send file");
-            close(file_fd);
-            return -1;
-        }
-
         remaining -= (unsigned long long)received;
     }
 
     close(file_fd);
-
     printf("[PID %ld] Download sent: %s (%llu bytes)\n",
            (long)getpid(), path, filesize);
     fflush(stdout);
@@ -656,13 +770,18 @@ static int handle_get(int client_fd, const char *arguments)
 static void handle_connection(int client_fd)
 {
     struct socket_reader reader = {0};
+    struct monitor_state monitor;
     char line[LINE_CAPACITY];
     int authenticated = 0;
+
+    if (init_monitor(&monitor) == -1) {
+        send_response(client_fd, "ERR 018 MONITOR_FAILED");
+        return;
+    }
 
     for (;;) {
         int result = read_line(client_fd, &reader,
                                line, sizeof(line));
-
         if (result != 1) {
             if (result == 0) {
                 printf("[PID %ld] Client disconnected\n",
@@ -674,7 +793,6 @@ static void handle_connection(int client_fd)
             } else {
                 send_response(client_fd, "ERR 006 INVALID_LINE");
             }
-
             fflush(stdout);
             break;
         }
@@ -686,7 +804,6 @@ static void handle_connection(int client_fd)
         if (!authenticated) {
             if (strcmp(line, "AUTH " AUTH_TOKEN) == 0) {
                 authenticated = 1;
-
                 if (send_response(client_fd,
                                   "OK AUTHENTICATED") == -1) {
                     break;
@@ -696,13 +813,11 @@ static void handle_connection(int client_fd)
                                   "ERR 001 AUTH_FAILED") == -1) {
                     break;
                 }
-
                 if (strcmp(line, "PUT") == 0 ||
                     strncmp(line, "PUT ", 4) == 0) {
                     break;
                 }
             }
-
             continue;
         }
 
@@ -714,14 +829,13 @@ static void handle_connection(int client_fd)
                     break;
                 }
             } else {
+                stop_monitor(&monitor);
                 authenticated = 0;
-
                 if (send_response(client_fd,
                                   "ERR 001 AUTH_FAILED") == -1) {
                     break;
                 }
             }
-
             continue;
         }
 
@@ -743,7 +857,6 @@ static void handle_connection(int client_fd)
             strncmp(line, "EXEC ", 5) == 0) {
             const char *name =
                 strcmp(line, "EXEC") == 0 ? "" : line + 5;
-
             if (handle_exec(client_fd, name) == -1) {
                 break;
             }
@@ -754,7 +867,6 @@ static void handle_connection(int client_fd)
             strncmp(line, "PUT ", 4) == 0) {
             const char *arguments =
                 strcmp(line, "PUT") == 0 ? "" : line + 4;
-
             if (handle_put(client_fd, &reader, arguments) == -1) {
                 break;
             }
@@ -765,14 +877,39 @@ static void handle_connection(int client_fd)
             strncmp(line, "GET ", 4) == 0) {
             const char *arguments =
                 strcmp(line, "GET") == 0 ? "" : line + 4;
-
             if (handle_get(client_fd, arguments) == -1) {
                 break;
             }
             continue;
         }
 
+        if (strncmp(line, "MONITOR START ", 14) == 0) {
+            if (start_monitor(client_fd, &monitor,
+                              line + 14) == -1) {
+                break;
+            }
+            continue;
+        }
+
+        if (strcmp(line, "MONITOR START") == 0) {
+            if (send_response(client_fd,
+                              "ERR 017 INVALID_UDP_PORT") == -1) {
+                break;
+            }
+            continue;
+        }
+
+        if (strcmp(line, "MONITOR STOP") == 0) {
+            stop_monitor(&monitor);
+            if (send_response(client_fd,
+                              "OK MONITOR_STOPPED") == -1) {
+                break;
+            }
+            continue;
+        }
+
         if (strcmp(line, "QUIT") == 0) {
+            stop_monitor(&monitor);
             send_response(client_fd, "OK BYE");
             break;
         }
@@ -782,25 +919,25 @@ static void handle_connection(int client_fd)
             break;
         }
     }
+
+    /* Covers EOF, receive errors, and failed TCP responses. */
+    stop_monitor(&monitor);
+    pthread_cond_destroy(&monitor.condition);
+    pthread_mutex_destroy(&monitor.mutex);
 }
 
 int main(void)
 {
     if (ensure_directory(STORAGE_ROOT) == -1 ||
-        ensure_directory(STORAGE_PATH) == -1) {
-        return EXIT_FAILURE;
-    }
-
-    if (install_child_reaper() == -1) {
+        ensure_directory(STORAGE_PATH) == -1 ||
+        install_child_reaper() == -1) {
         return EXIT_FAILURE;
     }
 
     int reuse = 1;
     struct sockaddr_in server_addr = {0};
-
     int listen_fd = socket(AF_INET,
                            SOCK_STREAM | SOCK_CLOEXEC, 0);
-
     if (listen_fd == -1) {
         perror("socket");
         return EXIT_FAILURE;
@@ -823,7 +960,6 @@ int main(void)
         close(listen_fd);
         return EXIT_FAILURE;
     }
-
     if (listen(listen_fd, BACKLOG) == -1) {
         perror("listen");
         close(listen_fd);
@@ -833,16 +969,16 @@ int main(void)
     printf("Agent listening on TCP port %d\n", AGENT_PORT);
     printf("File storage: %s\n", STORAGE_PATH);
     printf("Concurrency model: fork per connection\n");
+    printf("Monitoring interval: %d seconds\n", MONITOR_INTERVAL);
     printf("Parent PID: %ld\n", (long)getpid());
     fflush(stdout);
 
     for (;;) {
         struct sockaddr_in client_addr = {0};
         socklen_t client_len = sizeof(client_addr);
-
-        int client_fd = accept4(listen_fd,
-                                (struct sockaddr *)&client_addr,
-                                &client_len, SOCK_CLOEXEC);
+        int client_fd = accept4(
+            listen_fd, (struct sockaddr *)&client_addr,
+            &client_len, SOCK_CLOEXEC);
 
         if (client_fd == -1) {
             if (errno == EINTR) {
@@ -852,9 +988,7 @@ int main(void)
             continue;
         }
 
-        /* Flush stdio before fork to avoid duplicated output. */
         fflush(NULL);
-
         pid_t child_pid = fork();
 
         if (child_pid == -1) {
@@ -865,41 +999,33 @@ int main(void)
         }
 
         if (child_pid == 0) {
-            /* Child serves this connection only. */
             close(listen_fd);
-
             if (reset_child_signal() == -1) {
                 close(client_fd);
                 _exit(EXIT_FAILURE);
             }
 
             char client_ip[INET_ADDRSTRLEN];
-
             if (inet_ntop(AF_INET, &client_addr.sin_addr,
                           client_ip, sizeof(client_ip)) != NULL) {
                 printf("[PID %ld] Connection accepted from %s:%u\n",
                        (long)getpid(), client_ip,
                        (unsigned int)ntohs(client_addr.sin_port));
             } else {
-                perror("inet_ntop");
                 printf("[PID %ld] Connection accepted\n",
                        (long)getpid());
             }
-
             fflush(stdout);
 
             handle_connection(client_fd);
             close(client_fd);
-
             printf("[PID %ld] Connection closed\n",
                    (long)getpid());
             fflush(stdout);
             _exit(EXIT_SUCCESS);
         }
 
-        /* Parent keeps accepting; it does not serve this socket. */
         close(client_fd);
-
         printf("Started connection child PID: %ld\n",
                (long)child_pid);
         fflush(stdout);

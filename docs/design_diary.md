@@ -33,3 +33,8 @@ Selected fork-per-connection concurrency to isolate blocking session
 operations and authentication state. The parent reaps connection
 children; each child resets SIGCHLD handling for popen()/pclose().
 Tested AUTH and SYSINFO with five connections held open together.
+Used one monitoring thread per active session so UDP updates continue
+while the TCP handler waits for commands. Selected a two-second
+interval using a monotonic clock. STOP and QUIT signal and join the
+thread before closing its UDP socket. Verified START, STOP, continued
+TCP operation, and cleanup on QUIT.

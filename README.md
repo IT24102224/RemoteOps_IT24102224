@@ -30,9 +30,8 @@ and file transfers. UDP will carry periodic monitoring statistics.
 - Git 2.43.0
 
 ##Verified functionality:
-- The Agent uses fork-per-connection concurrency, with independent
-  authentication state and receive buffers for each session.
-- Five simultaneous Bash TCP sessions received AUTH and SYSINFO
-  responses with SID:4222.
-- The parent reaps completed connection children using SIGCHLD
-  and waitpid().
+- MONITOR START sends SID-tagged UDP system statistics every
+  two seconds to the client's IP and requested UDP port.
+- MONITOR STOP stops the stream while TCP commands remain usable.
+- QUIT stops active monitoring and closes the TCP connection.
+- Monitoring was tested using a Bash TCP client and Netcat UDP receiver.

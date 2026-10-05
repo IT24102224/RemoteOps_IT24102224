@@ -1,15 +1,17 @@
+.RECIPEPREFIX := >
+
 CC = gcc
-CFLAGS = -std=c11 -Wall -Wextra -Wpedantic -O2
+CFLAGS = -std=c11 -Wall -Wextra -Wpedantic -O2 -pthread
 
 .PHONY: all clean
 
 all: agent controller
 
 agent: agent_224.c
-	$(CC) $(CFLAGS) -o agent agent_224.c
+>$(CC) $(CFLAGS) -o $@ $<
 
 controller: controller_224.c
-	$(CC) $(CFLAGS) -o controller controller_224.c
+>$(CC) $(CFLAGS) -o $@ $<
 
 clean:
-	rm -f agent controller
+>rm -f agent controller
