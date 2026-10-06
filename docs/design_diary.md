@@ -45,3 +45,10 @@ threads. Recorded connection events, commands, responses, and transfer
 start/completion details while redacting authentication tokens.
 Verified command and transfer logs, and confirmed that client EOF
 does not prevent subsequent connections.
+oct 6
+Extended the Controller with interactive TCP commands, size-based
+file transfers, and a separate UDP receiver thread. Reading TCP
+headers through the newline preserves following file bytes.
+Downloads use temporary files to avoid keeping incomplete results.
+Verified TCP commands, identical uploaded/downloaded files,
+monitoring alongside TCP requests, STOP, and QUIT.
